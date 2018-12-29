@@ -160,6 +160,7 @@ RetryStatus RetryStateImpl::shouldRetry(const Http::HeaderMap* response_headers,
   resetRetry();
 
   if (retries_remaining_ == 0) {
+    ENVOY_LOG_MISC(warn, "NM: retries_remaining = 0");
     return RetryStatus::No;
   }
 
@@ -169,11 +170,13 @@ RetryStatus RetryStateImpl::shouldRetry(const Http::HeaderMap* response_headers,
   }
 
   if (!cluster_.resourceManager(priority_).retries().canCreate()) {
+    ENVOY_LOG_MISC(warn, "NM: !retries.canCreate, max={}", cluster_.resourceManager(priority_).retries().max());
     cluster_.stats().upstream_rq_retry_overflow_.inc();
     return RetryStatus::NoOverflow;
   }
 
   if (!runtime_.snapshot().featureEnabled("upstream.use_retry", 100)) {
+    ENVOY_LOG_MISC(warn, "NM: !featureEnabled(upstream.use_retry)");
     return RetryStatus::No;
   }
 
@@ -206,7 +209,11 @@ bool RetryStateImpl::wouldRetryFromHeaders(const Http::HeaderMap& response_heade
   }
 
   if ((retry_on_ & RetryPolicy::RETRY_ON_RETRIABLE_STATUS_CODES)) {
+    ENVOY_LOG_MISC(warn, "NM: wouldRetryFromHeaders - checking status codes");
     for (auto code : retriable_status_codes_) {
+      ENVOY_LOG_MISC(warn, "NM: wouldRetryFromHeaders - responseStatus=[{}], code=[{}]",
+          Http::Utility::getResponseStatus(response_headers),
+          code);
       if (Http::Utility::getResponseStatus(response_headers) == code) {
         return true;
       }
@@ -238,16 +245,46 @@ bool RetryStateImpl::wouldRetryFromHeaders(const Http::HeaderMap& response_heade
 }
 
 bool RetryStateImpl::wouldRetryFromReset(const Http::StreamResetReason& reset_reason) {
+  const char* reason_str;
+  switch (reset_reason) {
+    case Http::StreamResetReason::LocalReset:
+      reason_str = "LocalReset";
+      break;
+    case Http::StreamResetReason::LocalRefusedStreamReset:
+      reason_str = "LocalRefusedStreamReset";
+      break;
+    case Http::StreamResetReason::RemoteReset:
+      reason_str = "RemoteReset";
+      break;
+    case Http::StreamResetReason::RemoteRefusedStreamReset:
+      reason_str = "RemoteRefusedStreamReset";
+      break;
+    case Http::StreamResetReason::ConnectionFailure:
+      reason_str = "ConnectionFailure";
+      break;
+    case Http::StreamResetReason::ConnectionTermination:
+      reason_str = "ConnectionTermination";
+      break;
+    case Http::StreamResetReason::Overflow:
+      reason_str = "Overflow";
+      break;
+    default:
+      reason_str = "Unknown";
+      break;
+  }
+
   if ((retry_on_ & RetryPolicy::RETRY_ON_REFUSED_STREAM) &&
       reset_reason == Http::StreamResetReason::RemoteRefusedStreamReset) {
     return true;
   }
 
   if ((retry_on_ & RetryPolicy::RETRY_ON_CONNECT_FAILURE) &&
-      reset_reason == Http::StreamResetReason::ConnectionFailure) {
+      (reset_reason == Http::StreamResetReason::ConnectionFailure ||
+      reset_reason == Http::StreamResetReason::ConnectionTermination)) {
     return true;
   }
 
+  ENVOY_LOG_MISC(warn, "NM: wouldRetryFromReset - reason=[{}]", reason_str);
   return false;
 }
 
@@ -255,31 +292,52 @@ bool RetryStateImpl::wouldRetry(const Http::HeaderMap* response_headers,
                                 const absl::optional<Http::StreamResetReason>& reset_reason) {
   // First check "never retry" conditions so we can short circuit, then delegate to
   // helper methods for checks dependant on retry policy.
-
+  bool ok = false;
   // we never retry if the reset reason is overflow.
   if (reset_reason && reset_reason.value() == Http::StreamResetReason::Overflow) {
+    ENVOY_LOG_MISC(warn, "NM: reset_reason = Overflow");
     return false;
   }
 
   if (response_headers != nullptr) {
     // We never retry if the overloaded header is set.
     if (response_headers->EnvoyOverloaded() != nullptr) {
+      ENVOY_LOG_MISC(warn, "NM: response_headers->EnvoyOverloaded");
       return false;
     }
 
     // We never retry if the request is rate limited.
     if (response_headers->EnvoyRateLimited() != nullptr) {
+      ENVOY_LOG_MISC(warn, "NM: response_headers->EnvoyRateLimited");
       return false;
     }
 
     if (wouldRetryFromHeaders(*response_headers)) {
       return true;
     }
+
+    if (Http::Utility::getResponseStatus(*response_headers) != 200) {
+      ENVOY_LOG_MISC(warn, "NM: response_headers != null");
+      std::cout << "NM: " << *response_headers << std::endl;
+    } else {
+      ok = true;
+    }
   } else if (retry_on_ & (RetryPolicy::RETRY_ON_5XX | RetryPolicy::RETRY_ON_GATEWAY_ERROR)) {
     // wouldRetry() is passed null headers when there was an upstream reset. Currently we count an
     // upstream reset as a "5xx" (since it will result in one). We may eventually split this out
     // into its own type. I.e., RETRY_ON_RESET.
     return true;
+  } else if ((retry_on_ & RetryPolicy::RETRY_ON_RETRIABLE_STATUS_CODES)) {
+    // Additionally check for 503
+    for (auto code : retriable_status_codes_) {
+      if (code == 503) {
+        return true;
+      }
+    }
+  }
+
+  if (!reset_reason && !ok) {
+    ENVOY_LOG_MISC(warn, "NM: wouldRetry - no reset_reason");
   }
 
   return reset_reason && wouldRetryFromReset(*reset_reason);
